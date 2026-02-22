@@ -9,6 +9,19 @@ class Standard:
 		self.helix_usb = helix_usb
 		self.name = name
 
+	@staticmethod
+	def _packet_signature(data):
+		length = len(data)
+		route = {
+			'bus': data[4] if length > 4 else None,
+			'endpoint': data[6] if length > 6 else None,
+			'type': data[7] if length > 7 else None,
+			'payload_len': data[11] if length > 11 else None,
+		}
+		head = ','.join('0x{:02x}'.format(x) for x in data[:8])
+		tail = ','.join('0x{:02x}'.format(x) for x in data[-4:]) if length >= 4 else head
+		return 'len={}, route={}, head=[{}], tail=[{}]'.format(length, route, head, tail)
+
 	def start(self):
 		log.info('Starting mode')
 
@@ -126,6 +139,11 @@ class Standard:
 			# Occurs once while every preset switch initiated at the stomp. data[42] seems to carry the preset number
 			pass
 
+		elif self.helix_usb.my_byte_cmp(left=data, right=[0x27, 0x0, 0x0, 0x18, 0xf0, 0x3, 0x2, 0x10, 0x0, "XX", 0x0, 0x4, 0x9, 0x2, 0x0, 0x0], length=16):
+			# Preset-step and related UI traffic can emit additional 0x27 status frames
+			# that are expected but currently not decoded here. Avoid warning flood.
+			return False
+
 		elif self.helix_usb.my_byte_cmp(left=data, right=[0x8, 0x0, 0x0, 0x18, 0xed, 0x3, 0x80, 0x10, 0x0, "XX", 0x0, 0x8, "XX", "XX", 0x0, 0x0]):
 			# This message signals that a preset transfer has ended in data[11] == 0x08.
 			# Indeed, it should usually be received and properly processed by request_preset mode!
@@ -134,11 +152,24 @@ class Standard:
 			# But if we receive it here, we can ignore it.
 			pass
 
+		elif self.helix_usb.my_byte_cmp(left=data, right=[0x8, 0x1, 0x0, 0x18, 0xef, 0x3, 0x1, 0x10, 0x0, "XX", 0x0, 0x4, "XX", 0x2, 0x0, 0x0, "XX"], length=17):
+			# Late packet from preset-names transfer stream can arrive after mode switched back to standard.
+			# Acknowledge and swallow to avoid warning flood.
+			out = OutPacket(data=[0x8, 0x0, 0x0, 0x18, 0x1, 0x10, 0xef, 0x3, 0x0, "XX", 0x0, 0x8, 0x38, data[9] + 9, 0x0, 0x0])
+			self.helix_usb.out_packet_to_endpoint_0x1(out, silent=True)
+			return False
+
+		elif self.helix_usb.my_byte_cmp(left=data, right=["XX", 0x0, 0x0, 0x18, 0xef, 0x3, 0x1, 0x10, 0x0, "XX", 0x0, 0x4, "XX", 0x2, 0x0, 0x0], length=16):
+			# Same transfer family as above with variable packet size; treat as expected late preset-name stream traffic.
+			out = OutPacket(data=[0x8, 0x0, 0x0, 0x18, 0x1, 0x10, 0xef, 0x3, 0x0, "XX", 0x0, 0x8, 0x38, data[9] + 9, 0x0, 0x0])
+			self.helix_usb.out_packet_to_endpoint_0x1(out, silent=True)
+			return False
+
 		else:
 			if self.helix_usb.check_keep_alive_response(data):
 				return False  # don't print incoming message to console
 
 			hex_str = ''.join('0x{:x}, '.format(x) for x in data)
-			log.warning("Unexpected message in mode: " + str(hex_str))
+			log.warning("Unexpected message in mode %s: %s | %s", self.name, self._packet_signature(data), str(hex_str))
 
 		return True  # print incoming message to console
